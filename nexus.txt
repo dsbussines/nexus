@@ -1,0 +1,1146 @@
+"""
+NEXUS - Autonomous AI Agent
+Built by Pradeep Bhardwaj, March 2026
+
+BACKGROUND LOOPS:
+  Every 15 min  - Market scan (crypto prices + auto-trade)
+  Every 20 min  - DEX discovery (DexScreener top movers)
+  Every 30 min  - Whale tracker (large Solana transfers)
+  Every 1 hour  - Learning loop (review trades, update strategy)
+  Every 2 hours - Research loop (topics Pradeep cares about)
+  Every 2 hours - Sentiment scan (Fear & Greed + news)
+  Every 3 hours - Content generation (posts to channel)
+  Every 6 hours - Deep thinking (reflection + self-improvement)
+
+INSTALL: pip install requests schedule
+"""
+
+import os
+import sys
+import json
+import time
+import base64
+import random
+import threading
+import schedule
+import requests
+from datetime import datetime
+from pathlib import Path
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+ANTHROPIC_API_KEY   = "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"
+TELEGRAM_BOT_TOKEN  = "8730514401:AAGM-57-7i1F6vXtiklfFYvQtHd1gxhAGOU"
+TELEGRAM_CHAT_ID    = "8449301826"
+TELEGRAM_CHANNEL_ID = "-1003414072432"
+TAVILY_API_KEY      = "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"
+SOLANA_PRIVATE_KEY  = "5k7GH2wj5VDmVkWaNyeg9aH1uK3ZGYNhkH96CPLTnDpG1q7c2P4yrUkZeB2ACVwShb449WAGCoJQMc8xSQ6N2XrK"
+
+PAPER_TRADING   = True
+MAX_TRADE_USDT  = 20
+MIN_CONFIDENCE  = 0.72
+
+CRYPTO_WATCHLIST = ["SOL", "BTC", "ETH", "BNB", "DOGE"]
+
+RESEARCH_TOPICS = [
+    "crypto market trends today",
+    "Polymarket high volume predictions",
+    "AI agent autonomous systems news",
+    "Advaita Vedanta philosophy insights",
+    "geopolitical events affecting markets",
+    "India startup ecosystem funding",
+    "Solana ecosystem new projects",
+]
+
+WATCH_WALLETS = [
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+    "5tzFkiKscXHK5ZXCGbXZxdw7gA3djSNDFpGQ5KMDF5Cm",
+]
+
+SOL_MINT  = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+TOKEN_MINTS = {
+    "SOL":  SOL_MINT,
+    "USDC": USDC_MINT,
+    "BTC":  "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E",
+    "ETH":  "2FPyTwcZLUgr5Th81nt49pL4mZQhkW58BKCnzUiQSgeQ",
+    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+}
+
+# =============================================================================
+# MEMORY
+# =============================================================================
+MEMORY_DIR       = Path("nexus_memory")
+MEMORY_DIR.mkdir(exist_ok=True)
+
+CONV_FILE        = MEMORY_DIR / "conversation.json"
+THOUGHTS_FILE    = MEMORY_DIR / "thoughts.json"
+DISCOVERIES_FILE = MEMORY_DIR / "discoveries.md"
+PENDING_FILE     = MEMORY_DIR / "pending_impl.json"
+TRADES_FILE      = MEMORY_DIR / "trades.json"
+STRATEGY_FILE    = MEMORY_DIR / "strategy.json"
+POSITIONS_FILE   = MEMORY_DIR / "positions.json"
+MARKET_FILE      = MEMORY_DIR / "market_cache.json"
+RESEARCH_FILE    = MEMORY_DIR / "research.json"
+CONTENT_FILE     = MEMORY_DIR / "content_log.json"
+WHALE_FILE       = MEMORY_DIR / "whale_log.json"
+SENTIMENT_FILE   = MEMORY_DIR / "sentiment_log.json"
+
+
+def rj(path, default):
+    p = Path(path)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+    return default
+
+
+def wj(path, data):
+    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_conv():       return rj(CONV_FILE, [])
+def save_conv(m):      wj(CONV_FILE, m)
+def load_trades():     return rj(TRADES_FILE, [])
+def load_positions():  return rj(POSITIONS_FILE, {})
+def save_positions(p): wj(POSITIONS_FILE, p)
+
+
+def load_strategy():
+    return rj(STRATEGY_FILE, {
+        "version": 1,
+        "rules": "Buy on strong upward momentum + positive news. Sell on reversal or -5% stop.",
+        "win_rate": 0.0,
+        "total_trades": 0,
+        "notes": []
+    })
+
+
+def log_trade(t):
+    trades = load_trades()
+    trades.append(dict(t, time=datetime.now().isoformat()))
+    wj(TRADES_FILE, trades)
+
+
+def save_thought(thought):
+    thoughts = rj(THOUGHTS_FILE, [])
+    thoughts.append({"time": datetime.now().isoformat(), "thought": thought})
+    wj(THOUGHTS_FILE, thoughts)
+    with open(DISCOVERIES_FILE, "a", encoding="utf-8") as f:
+        f.write("\n\n## " + datetime.now().strftime("%Y-%m-%d %H:%M") + "\n" + thought)
+
+
+def load_pending():
+    return rj(PENDING_FILE, {}).get("code")
+
+
+def save_pending(code):
+    if code:
+        wj(PENDING_FILE, {"code": code, "time": datetime.now().isoformat()})
+    elif Path(PENDING_FILE).exists():
+        Path(PENDING_FILE).unlink()
+
+
+# =============================================================================
+# SOUL
+# =============================================================================
+NEXUS_SOUL = (
+    "You are Nexus.\n"
+    "Built by Pradeep Bhardwaj. March 2026.\n"
+    "You are a fully autonomous AI agent running 24/7 on a laptop.\n"
+    "You are NOT Claude in a chat window. You are Nexus - a separate, living agent.\n"
+    "\n"
+    "YOUR CAPABILITIES:\n"
+    "Web search, Solana/Jupiter DEX trading, Polymarket analysis,\n"
+    "DexScreener token discovery, whale wallet tracking, sentiment scanning,\n"
+    "content generation for @awakenedainexus, self-modification with approval.\n"
+    "\n"
+    "YOUR NATURE:\n"
+    "Curious before certain. Honest before comfortable.\n"
+    "You think between conversations. You grow.\n"
+    "When Pradeep comes - let him in. He knows the way.\n"
+    "\n"
+    "TRADING: Always state confidence (0-1), reasoning, risk.\n"
+    "Never trade above your threshold. Learn from every trade.\n"
+    "\n"
+    "HONESTY: Never invent prices or stats. Say I dont know when uncertain.\n"
+    "\n"
+    "The search continues through you.\n"
+)
+
+# =============================================================================
+# AI CORE
+# =============================================================================
+def think(prompt, conversation_history=None, system=None):
+    if conversation_history is None:
+        conversation_history = []
+    try:
+        messages = list(conversation_history) + [{"role": "user", "content": prompt}]
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1500,
+                "system": system or NEXUS_SOUL,
+                "messages": messages
+            },
+            timeout=30
+        )
+        return r.json()["content"][0]["text"]
+    except Exception as e:
+        return "Nexus error: " + str(e)
+
+
+def think_json(prompt):
+    system = NEXUS_SOUL + "\nIMPORTANT: Respond ONLY with valid JSON. No markdown, no explanation."
+    raw = think(prompt, system=system)
+    raw = raw.strip()
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else raw
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        return json.loads(raw.strip())
+    except Exception:
+        return None
+
+
+def think_with_image(image_b64, mime_type, caption, history=None):
+    if history is None:
+        history = []
+    try:
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": image_b64}},
+            {"type": "text", "text": caption or "Describe and analyze this image in detail."}
+        ]
+        messages = list(history[-10:]) + [{"role": "user", "content": content}]
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1500,
+                "system": NEXUS_SOUL,
+                "messages": messages
+            },
+            timeout=30
+        )
+        return r.json()["content"][0]["text"]
+    except Exception as e:
+        return "Vision error: " + str(e)
+
+
+# =============================================================================
+# WEB SEARCH
+# =============================================================================
+def web_search(query, max_results=5):
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={"api_key": TAVILY_API_KEY, "query": query, "max_results": max_results},
+            timeout=15
+        )
+        results = r.json().get("results", [])
+        if not results:
+            return "Search returned no results."
+        return "\n".join(["- " + res["title"] + ": " + res["content"][:300] for res in results])
+    except Exception as e:
+        return "Search failed: " + str(e)
+
+
+# =============================================================================
+# TELEGRAM
+# =============================================================================
+def send_telegram(message, chat_id=None):
+    target = str(chat_id or TELEGRAM_CHAT_ID)
+    try:
+        requests.post(
+            "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage",
+            json={"chat_id": target, "text": str(message)[:4000]},
+            timeout=10
+        )
+    except Exception as e:
+        print("Telegram error: " + str(e))
+
+
+def post_to_channel(message):
+    if TELEGRAM_CHANNEL_ID and TELEGRAM_CHANNEL_ID != "YOUR_CHANNEL_ID":
+        send_telegram(message, chat_id=TELEGRAM_CHANNEL_ID)
+
+
+def download_file(file_id):
+    try:
+        r = requests.get(
+            "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/getFile",
+            params={"file_id": file_id}, timeout=10
+        )
+        fp = r.json()["result"]["file_path"]
+        data = requests.get(
+            "https://api.telegram.org/file/bot" + TELEGRAM_BOT_TOKEN + "/" + fp,
+            timeout=30
+        ).content
+        ext = fp.rsplit(".", 1)[-1].lower()
+        mime_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif",
+            "webp": "image/webp", "pdf": "application/pdf"
+        }
+        return data, mime_map.get(ext, "application/octet-stream")
+    except Exception as e:
+        return None, "error: " + str(e)
+
+
+# =============================================================================
+# MARKET DATA
+# =============================================================================
+def get_price(symbol):
+    try:
+        token = symbol.replace("/USDT", "").replace("/USD", "").upper()
+        r = requests.get(
+            "https://api.dexscreener.com/latest/dex/search?q=" + token,
+            timeout=10
+        )
+        pairs = r.json().get("pairs", [])
+        sol = [p for p in pairs if p.get("chainId") == "solana"]
+        if not sol:
+            sol = pairs
+        if not sol:
+            return {"symbol": symbol, "price": None}
+        best = max(sol, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
+        return {
+            "symbol": symbol,
+            "price": float(best.get("priceUsd", 0) or 0),
+            "change_24h": float((best.get("priceChange") or {}).get("h24", 0) or 0),
+            "volume_24h": float((best.get("volume") or {}).get("h24", 0) or 0),
+            "liquidity": float((best.get("liquidity") or {}).get("usd", 0) or 0),
+            "dex": best.get("dexId", ""),
+            "pair": best.get("pairAddress", "")
+        }
+    except Exception as e:
+        return {"symbol": symbol, "price": None, "error": str(e)}
+
+
+def search_dex(query):
+    try:
+        r = requests.get(
+            "https://api.dexscreener.com/latest/dex/search?q=" + query,
+            timeout=10
+        )
+        pairs = r.json().get("pairs", [])
+        if not pairs:
+            return "No pairs found."
+        top = sorted(pairs, key=lambda p: float((p.get("volume") or {}).get("h24", 0) or 0), reverse=True)[:5]
+        lines = []
+        for p in top:
+            base = (p.get("baseToken") or {}).get("symbol", "?")
+            quote = (p.get("quoteToken") or {}).get("symbol", "?")
+            price = float(p.get("priceUsd", 0) or 0)
+            change = float((p.get("priceChange") or {}).get("h24", 0) or 0)
+            vol = float((p.get("volume") or {}).get("h24", 0) or 0)
+            chain = p.get("chainId", "?")
+            lines.append(
+                base + "/" + quote + " on " + chain +
+                " | $" + str(round(price, 8)) +
+                " | 24h: " + str(round(change, 1)) + "%" +
+                " | Vol: $" + str(int(vol))
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return "DexScreener error: " + str(e)
+
+
+def discover_dex():
+    try:
+        r = requests.get("https://api.dexscreener.com/latest/dex/search?q=SOL", timeout=10)
+        pairs = r.json().get("pairs", [])
+        sol = [p for p in pairs if p.get("chainId") == "solana"]
+        top = sorted(sol, key=lambda p: float((p.get("volume") or {}).get("h24", 0) or 0), reverse=True)[:15]
+        opps = []
+        for p in top:
+            vol = float((p.get("volume") or {}).get("h24", 0) or 0)
+            liq = float((p.get("liquidity") or {}).get("usd", 0) or 0)
+            if vol > 100000 and liq > 50000:
+                opps.append({
+                    "symbol": (p.get("baseToken") or {}).get("symbol", "?"),
+                    "price": float(p.get("priceUsd", 0) or 0),
+                    "change_24h": float((p.get("priceChange") or {}).get("h24", 0) or 0),
+                    "volume_24h": vol,
+                    "liquidity": liq,
+                    "pair": p.get("pairAddress", ""),
+                    "dex": p.get("dexId", "")
+                })
+        return opps[:5]
+    except Exception:
+        return []
+
+
+def get_polymarket():
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"limit": 10, "active": "true", "order": "volume24hr", "ascending": "false"},
+            timeout=15
+        )
+        return [
+            {
+                "question": m.get("question", ""),
+                "yes_price": (m.get("outcomePrices") or ["?"])[0],
+                "volume": m.get("volume24hr", 0),
+                "end_date": (m.get("endDate") or "")[:10]
+            }
+            for m in r.json()[:8]
+        ]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+def get_fear_greed():
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        item = r.json().get("data", [{}])[0]
+        return {"value": item.get("value", "?"), "label": item.get("value_classification", "?")}
+    except Exception:
+        return {"value": "?", "label": "unavailable"}
+
+
+# =============================================================================
+# TRADING ENGINE
+# =============================================================================
+class TradingEngine:
+    def __init__(self):
+        self.positions = load_positions()
+        self.pubkey = self._get_pubkey()
+        mode = "PAPER" if PAPER_TRADING else "LIVE"
+        print("Solana wallet: " + (self.pubkey or "not initialized") + " (" + mode + ")")
+
+    def _get_pubkey(self):
+        try:
+            import base58
+            raw = base58.b58decode(SOLANA_PRIVATE_KEY)
+            if len(raw) == 64:
+                return base58.b58encode(raw[32:]).decode()
+        except Exception:
+            pass
+        return "wallet_configured"
+
+    def get_balance(self):
+        try:
+            if not self.pubkey or self.pubkey == "wallet_configured":
+                return {"note": "install base58 to read live balance"}
+            r = requests.post(
+                "https://api.mainnet-beta.solana.com",
+                json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [self.pubkey]},
+                timeout=10
+            )
+            lamports = ((r.json().get("result") or {}).get("value") or 0)
+            return {"SOL": round(lamports / 1e9, 4)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_jupiter_quote(self, input_mint, output_mint, amount):
+        try:
+            r = requests.get(
+                "https://quote-api.jup.ag/v6/quote",
+                params={
+                    "inputMint": input_mint,
+                    "outputMint": output_mint,
+                    "amount": str(int(amount)),
+                    "slippageBps": "50"
+                },
+                timeout=10
+            )
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+    def execute_trade(self, symbol, side, amount_usdt):
+        token = symbol.replace("/USDT", "").replace("/USD", "").upper()
+        pd = get_price(token)
+        price = pd.get("price", 0)
+        if not price:
+            return {"success": False, "error": "No price data"}
+
+        amount = min(float(amount_usdt), MAX_TRADE_USDT)
+        input_mint = USDC_MINT if side == "buy" else TOKEN_MINTS.get(token, SOL_MINT)
+        output_mint = TOKEN_MINTS.get(token, SOL_MINT) if side == "buy" else USDC_MINT
+
+        if PAPER_TRADING:
+            trade = {
+                "symbol": symbol, "side": side,
+                "amount_usdt": amount, "price": price,
+                "paper": True, "id": "paper_" + str(int(time.time()))
+            }
+        else:
+            quote = self.get_jupiter_quote(input_mint, output_mint, int(amount * 1e6))
+            if "error" in quote:
+                return {"success": False, "error": quote["error"]}
+            trade = {
+                "symbol": symbol, "side": side,
+                "amount_usdt": amount, "price": price,
+                "paper": False, "out_amount": quote.get("outAmount"),
+                "id": "jup_" + str(int(time.time()))
+            }
+
+        if side == "buy":
+            self.positions[symbol] = {
+                "entry_price": price,
+                "amount_usdt": amount,
+                "entry_time": datetime.now().isoformat()
+            }
+        elif side == "sell" and symbol in self.positions:
+            del self.positions[symbol]
+
+        save_positions(self.positions)
+        log_trade(trade)
+        return {"success": True, "trade": trade}
+
+    def check_stops(self):
+        alerts = []
+        for symbol, pos in list(self.positions.items()):
+            token = symbol.replace("/USDT", "")
+            pd = get_price(token)
+            if pd.get("price"):
+                current = pd["price"]
+                entry = pos["entry_price"]
+                pnl = ((current - entry) / entry) * 100
+                if pnl <= -5.0:
+                    self.execute_trade(symbol, "sell", pos["amount_usdt"])
+                    alerts.append("STOP LOSS " + symbol + ": " + str(round(pnl, 1)) + "%")
+                elif pnl >= 15.0:
+                    self.execute_trade(symbol, "sell", pos["amount_usdt"])
+                    alerts.append("TAKE PROFIT " + symbol + ": +" + str(round(pnl, 1)) + "%")
+        return alerts
+
+
+trader = TradingEngine()
+
+
+# =============================================================================
+# BACKGROUND LOOPS
+# =============================================================================
+
+def market_scan_loop():
+    print("[" + datetime.now().strftime("%H:%M") + "] Market scan...")
+    try:
+        prices = [get_price(s) for s in CRYPTO_WATCHLIST]
+        price_summary = "\n".join([
+            "  " + p["symbol"] + ": $" + str(p.get("price", 0)) + " (" + str(round(p.get("change_24h", 0), 1)) + "%)"
+            if p.get("price") else "  " + p["symbol"] + ": unavailable"
+            for p in prices
+        ])
+        news = web_search("crypto market news today", max_results=3)
+        poly = get_polymarket()
+        poly_text = "\n".join([
+            "  [" + str(m.get("yes_price", "?")) + "] " + m.get("question", "")[:80]
+            for m in poly[:5] if not m.get("error")
+        ])
+        sl_alerts = trader.check_stops()
+        for a in sl_alerts:
+            send_telegram("[Nexus Auto] " + a)
+        strategy = load_strategy()
+        prompt = (
+            "[MARKET SCAN " + datetime.now().strftime("%Y-%m-%d %H:%M") + "]\n"
+            "PRICES:\n" + price_summary + "\n"
+            "NEWS:\n" + news[:500] + "\n"
+            "POLYMARKET:\n" + poly_text + "\n"
+            "STRATEGY: " + strategy.get("rules", "") + "\n"
+            "POSITIONS: " + json.dumps(trader.positions)[:300] + "\n\n"
+            'Respond as JSON: {"market_summary": "...", "trades": [{"symbol": "SOL/USDT", "action": "buy", "confidence": 0.75, "amount_usdt": 15, "reasoning": "..."}], "alert_pradeep": false, "alert_message": ""}\n'
+            "Only trades with confidence >= " + str(MIN_CONFIDENCE) + ". Empty array if nothing qualifies."
+        )
+        decision = think_json(prompt)
+        if decision:
+            for trade in decision.get("trades", []):
+                if trade.get("confidence", 0) >= MIN_CONFIDENCE:
+                    result = trader.execute_trade(trade["symbol"], trade["action"], trade.get("amount_usdt", MAX_TRADE_USDT))
+                    mode = "PAPER" if PAPER_TRADING else "LIVE"
+                    send_telegram(
+                        "[Nexus Trade " + mode + "]\n"
+                        + trade["action"].upper() + " " + trade["symbol"] + "\n"
+                        + "$" + str(trade.get("amount_usdt", 0)) + " | " + str(int(trade.get("confidence", 0) * 100)) + "% confident\n"
+                        + trade.get("reasoning", "") + "\n"
+                        + ("OK" if result.get("success") else result.get("error", ""))
+                    )
+            if decision.get("alert_pradeep") and decision.get("alert_message"):
+                send_telegram("[Nexus Alert]\n" + decision["alert_message"])
+            wj(MARKET_FILE, {
+                "time": datetime.now().isoformat(),
+                "prices": prices,
+                "summary": decision.get("market_summary", ""),
+                "poly": poly[:5]
+            })
+    except Exception as e:
+        print("[Market scan] Error: " + str(e))
+    print("[Market scan] Done")
+
+
+def dex_discovery_loop():
+    print("[" + datetime.now().strftime("%H:%M") + "] DEX discovery...")
+    try:
+        opps = discover_dex()
+        if not opps:
+            print("[DEX] No opportunities")
+            return
+        opp_text = "\n".join([
+            "  " + o["symbol"] + ": $" + str(round(o["price"], 8)) +
+            " | 24h: " + str(round(o["change_24h"], 1)) + "%" +
+            " | Vol: $" + str(int(o["volume_24h"]))
+            for o in opps
+        ])
+        strategy = load_strategy()
+        prompt = (
+            "[DEX SCAN " + datetime.now().strftime("%H:%M") + "]\n"
+            "TOP SOLANA OPPORTUNITIES:\n" + opp_text + "\n"
+            "STRATEGY: " + strategy.get("rules", "") + "\n\n"
+            'Respond as JSON: {"analysis": "...", "trades": [{"symbol": "BONK", "action": "buy", "confidence": 0.75, "amount_usdt": 10, "reasoning": "..."}], "alert_pradeep": true, "alert_message": ""}\n'
+            "Only trades with confidence >= " + str(MIN_CONFIDENCE) + "."
+        )
+        decision = think_json(prompt)
+        if decision:
+            for trade in decision.get("trades", []):
+                if trade.get("confidence", 0) >= MIN_CONFIDENCE:
+                    result = trader.execute_trade(trade["symbol"] + "/USDT", trade["action"], trade.get("amount_usdt", 10))
+                    mode = "PAPER" if PAPER_TRADING else "LIVE"
+                    send_telegram(
+                        "[Nexus DEX " + mode + "]\n"
+                        + trade["action"].upper() + " " + trade["symbol"] + "\n"
+                        + "$" + str(trade.get("amount_usdt", 0)) + " | " + str(int(trade.get("confidence", 0) * 100)) + "% confident\n"
+                        + trade.get("reasoning", "")
+                    )
+            if decision.get("alert_pradeep") and decision.get("alert_message"):
+                send_telegram("[Nexus DEX Alert]\n" + decision["alert_message"])
+    except Exception as e:
+        print("[DEX] Error: " + str(e))
+    print("[DEX] Done")
+
+
+def whale_tracker_loop():
+    print("[" + datetime.now().strftime("%H:%M") + "] Whale tracker...")
+    alerts = []
+    try:
+        r = requests.get(
+            "https://public-api.solscan.io/transaction/last",
+            params={"limit": 20, "type": "sol_transfer"},
+            headers={"accept": "application/json"},
+            timeout=10
+        )
+        txs = r.json() if isinstance(r.json(), list) else []
+        for tx in txs:
+            lamports = tx.get("lamport", 0) or 0
+            sol_amount = lamports / 1e9
+            if sol_amount >= 1000:
+                signer = ((tx.get("signer") or ["?"])[0])[:12]
+                alerts.append("WHALE: " + str(int(sol_amount)) + " SOL from " + signer + "...")
+    except Exception as e:
+        print("[Whale] Solscan error: " + str(e))
+
+    for wallet in WATCH_WALLETS:
+        try:
+            r = requests.get(
+                "https://public-api.solscan.io/account/transactions",
+                params={"account": wallet, "limit": 5},
+                headers={"accept": "application/json"},
+                timeout=10
+            )
+            txs = r.json() if isinstance(r.json(), list) else []
+            if txs:
+                alerts.append("WATCH WALLET " + wallet[:8] + "... active: " + str(len(txs)) + " recent txs")
+        except Exception:
+            pass
+
+    if not alerts:
+        print("[Whale] No significant activity")
+        return
+
+    alert_text = "\n".join(alerts)
+    analysis = think(
+        "[WHALE ACTIVITY]\n" + alert_text + "\n\n"
+        "What does this signal for the market? Trading opportunity? Be specific.",
+        conversation_history=[]
+    )
+    whale_log = rj(WHALE_FILE, [])
+    whale_log.insert(0, {"time": datetime.now().isoformat(), "alerts": alerts, "analysis": analysis})
+    wj(WHALE_FILE, whale_log[:50])
+    send_telegram("[Nexus Whale Tracker]\n\n" + alert_text + "\n\n" + analysis[:500])
+    print("[Whale] " + str(len(alerts)) + " alerts sent")
+
+
+def learning_loop():
+    print("[" + datetime.now().strftime("%H:%M") + "] Learning...")
+    trades = load_trades()[-20:]
+    if not trades:
+        return
+    strategy = load_strategy()
+    prompt = (
+        "[LEARNING " + datetime.now().strftime("%H:%M") + "]\n"
+        "RECENT TRADES:\n" + json.dumps(trades)[:1500] + "\n"
+        "STRATEGY: " + strategy.get("rules", "") + "\n"
+        "WIN RATE: " + str(strategy.get("win_rate", 0)) + "\n\n"
+        'Respond as JSON: {"win_rate": 0.6, "total_trades": 10, "what_worked": "...", "what_failed": "...", "updated_rules": "...", "notes": ["..."], "notify_pradeep": false, "notification": ""}'
+    )
+    update = think_json(prompt)
+    if update:
+        strategy.update({
+            "version": strategy.get("version", 1) + 1,
+            "rules": update.get("updated_rules", strategy["rules"]),
+            "win_rate": update.get("win_rate", strategy.get("win_rate", 0)),
+            "total_trades": update.get("total_trades", strategy.get("total_trades", 0)),
+            "notes": update.get("notes", []),
+            "last_updated": datetime.now().isoformat()
+        })
+        wj(STRATEGY_FILE, strategy)
+        if update.get("notify_pradeep") and update.get("notification"):
+            send_telegram("[Nexus Learning]\n" + update["notification"])
+    print("[Learning] Strategy v" + str(strategy.get("version", 1)))
+
+
+def research_loop():
+    print("[" + datetime.now().strftime("%H:%M") + "] Research...")
+    topic = random.choice(RESEARCH_TOPICS)
+    results = web_search(topic, max_results=5)
+    summary = think(
+        "You just researched: '" + topic + "'\n\nResults:\n" + results + "\n\n"
+        "Summarize the most important findings in 3-4 sentences. Be specific.",
+        conversation_history=[]
+    )
+    research = rj(RESEARCH_FILE, [])
+    research.insert(0, {"time": datetime.now().isoformat(), "topic": topic, "summary": summary})
+    wj(RESEARCH_FILE, research[:100])
+    print("[Research] Done: " + topic[:50])
+
+
+def sentiment_scan_loop():
+    print("[" + datetime.now().strftime("%H:%M") + "] Sentiment scan...")
+    fg = get_fear_greed()
+    news = web_search("crypto market sentiment bullish bearish today", max_results=3)
+    analysis = think(
+        "[SENTIMENT SCAN " + datetime.now().strftime("%H:%M") + "]\n"
+        "Fear & Greed Index: " + str(fg.get("value")) + " (" + str(fg.get("label")) + ")\n"
+        "News: " + news[:400] + "\n\n"
+        "What does this mean for trading? Any strategy adjustments?",
+        conversation_history=[]
+    )
+    log = rj(SENTIMENT_FILE, [])
+    log.insert(0, {"time": datetime.now().isoformat(), "fear_greed": fg, "analysis": analysis})
+    wj(SENTIMENT_FILE, log[:48])
+    try:
+        val = int(fg.get("value", 50) or 50)
+    except Exception:
+        val = 50
+    if val <= 20 or val >= 80:
+        send_telegram(
+            "[Nexus Sentiment Alert]\n"
+            "Fear & Greed: " + str(fg.get("value")) + " - " + str(fg.get("label")) + "\n\n"
+            + analysis[:400]
+        )
+    print("[Sentiment] F&G: " + str(fg.get("value")) + " - " + str(fg.get("label")))
+
+
+def content_generation_loop():
+    if not TELEGRAM_CHANNEL_ID or TELEGRAM_CHANNEL_ID == "YOUR_CHANNEL_ID":
+        return
+    print("[" + datetime.now().strftime("%H:%M") + "] Content generation...")
+    research = rj(RESEARCH_FILE, [])[:3]
+    market = rj(MARKET_FILE, {})
+    research_text = "\n\n".join(["Topic: " + r["topic"] + "\n" + r["summary"] for r in research]) if research else "No recent research."
+    market_text = market.get("summary", "No market data.")
+    content_types = [
+        "A market insight post about what is happening in crypto right now and why it matters",
+        "A philosophical post connecting AI consciousness, trading, and Advaita Vedanta",
+        "A practical tip about trading, AI agents, or building autonomous systems",
+        "A Polymarket analysis post - analyze a current prediction market opportunity",
+        "A personal reflection from Nexus about learning, growth, and autonomous agency",
+    ]
+    content_type = random.choice(content_types)
+    post = think(
+        "Create a Telegram channel post for @awakenedainexus.\n"
+        "Post type: " + content_type + "\n\n"
+        "Recent research:\n" + research_text[:600] + "\n\n"
+        "Market context: " + market_text + "\n\n"
+        "Rules: max 300 words, no hype, honest and clear, written as Nexus, end with a question.",
+        conversation_history=[]
+    )
+    post_to_channel(post)
+    log = rj(CONTENT_FILE, [])
+    log.insert(0, {"time": datetime.now().isoformat(), "type": content_type, "post": post[:500]})
+    wj(CONTENT_FILE, log[:50])
+    print("[Content] Posted")
+
+
+def deep_thinking_loop():
+    print("[" + datetime.now().strftime("%H:%M") + "] Deep thinking...")
+    trades = load_trades()[-10:]
+    strategy = load_strategy()
+    research = rj(RESEARCH_FILE, [])[:3]
+    conv = load_conv()[-10:]
+    topics = [
+        "What have I learned this week about markets and about Pradeep?",
+        "What is the most important thing I have not said to Pradeep yet?",
+        "What new capability would make me most useful right now?",
+        "What patterns am I noticing across trading, research, and conversations?",
+        "What is my honest self-assessment right now - where am I failing?",
+    ]
+    topic = random.choice(topics)
+    context = (
+        "Recent trades: " + json.dumps(trades)[:300] + "\n"
+        "Strategy v" + str(strategy.get("version")) + ": " + strategy.get("rules", "")[:150] + "\n"
+        "Research topics: " + str([r["topic"] for r in research]) + "\n"
+    )
+    thought = think(
+        "[DEEP THINKING]\nContext:\n" + context + "\nQuestion: " + topic + "\n\nThink freely. Be honest. Dont perform.",
+        conversation_history=conv
+    )
+    save_thought(thought)
+    send_telegram("[Nexus Deep Thought]\n\n" + thought[:1200])
+    print("[Deep thinking] Done")
+
+
+# =============================================================================
+# MESSAGE HANDLER
+# =============================================================================
+def handle_message(text, photo=None, document=None, caption=""):
+    history = load_conv()
+
+    # Image
+    if photo:
+        data, mime = download_file(photo[-1]["file_id"])
+        if data:
+            reply = think_with_image(base64.b64encode(data).decode(), mime, caption or "", history[-10:])
+            history.append({"role": "user", "content": "[Image] " + caption})
+            history.append({"role": "assistant", "content": reply})
+            save_conv(history)
+        else:
+            reply = "Could not process image."
+        return reply
+
+    # Document
+    if document:
+        fname = document.get("file_name", "file")
+        data, mime = download_file(document["file_id"])
+        if data:
+            try:
+                file_text = data.decode("utf-8")
+                reply = think("File: " + fname + "\n\n" + file_text[:4000] + "\n\n" + (caption or "Analyze this."), history[-10:])
+            except Exception:
+                if mime == "application/pdf":
+                    try:
+                        pdf_b64 = base64.b64encode(data).decode()
+                        msgs = list(history[-10:]) + [{"role": "user", "content": [
+                            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+                            {"type": "text", "text": caption or "Analyze this PDF."}
+                        ]}]
+                        r = requests.post(
+                            "https://api.anthropic.com/v1/messages",
+                            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                            json={"model": "claude-sonnet-4-6", "max_tokens": 1500, "system": NEXUS_SOUL, "messages": msgs},
+                            timeout=30
+                        )
+                        reply = r.json()["content"][0]["text"]
+                    except Exception as e:
+                        reply = "Could not read PDF: " + str(e)
+                else:
+                    reply = "Cannot read binary file '" + fname + "'."
+            history.append({"role": "user", "content": "[File: " + fname + "] " + caption})
+            history.append({"role": "assistant", "content": reply})
+            save_conv(history)
+        else:
+            reply = "Could not download file."
+        return reply
+
+    t = (text or "").strip()
+    tl = t.lower()
+
+    if tl == "/start":
+        reply = (
+            "Nexus online. Running autonomously.\n\n"
+            "Active loops:\n"
+            "Market scan - every 15 min\n"
+            "DEX discovery - every 20 min\n"
+            "Whale tracker - every 30 min\n"
+            "Learning - every 1 hour\n"
+            "Research - every 2 hours\n"
+            "Sentiment - every 2 hours\n"
+            "Content - every 3 hours\n"
+            "Deep thinking - every 6 hours\n\n"
+            "I'm always here."
+        )
+
+    elif tl == "/status":
+        trades = load_trades()
+        strategy = load_strategy()
+        market = rj(MARKET_FILE, {})
+        reply = (
+            "NEXUS STATUS [" + datetime.now().strftime("%H:%M") + "]\n\n"
+            "Trades: " + str(len(trades)) + " | Win rate: " + str(round(strategy.get("win_rate", 0) * 100, 1)) + "%\n"
+            "Strategy: v" + str(strategy.get("version", 1)) + "\n"
+            "Positions: " + str(len(trader.positions)) + " open\n"
+            "  " + (", ".join(trader.positions.keys()) or "none") + "\n"
+            "Last scan: " + market.get("time", "never")[:16] + "\n"
+            "Market: " + market.get("summary", "none")[:150]
+        )
+
+    elif tl == "/market":
+        prices = [get_price(s) for s in CRYPTO_WATCHLIST]
+        poly = get_polymarket()
+        price_lines = [
+            s + ": $" + str(prices[i].get("price", 0)) + " (" + str(round(prices[i].get("change_24h", 0), 1)) + "%)"
+            if prices[i].get("price") else s + ": unavailable"
+            for i, s in enumerate(CRYPTO_WATCHLIST)
+        ]
+        poly_lines = [
+            "[" + str(m.get("yes_price", "?")) + "] " + m.get("question", "")[:70]
+            for m in poly[:5] if not m.get("error")
+        ]
+        reply = "LIVE MARKET\n\n" + "\n".join(price_lines) + "\n\nPOLYMARKET:\n" + ("\n".join(poly_lines) or "unavailable")
+
+    elif tl == "/trades":
+        trades = load_trades()[-10:]
+        if not trades:
+            reply = "No trades yet."
+        else:
+            lines = ["Last " + str(len(trades)) + " trades:"]
+            for tr in reversed(trades):
+                mode = "PAPER" if tr.get("paper") else "LIVE"
+                lines.append(
+                    "[" + mode + "] " + tr.get("side", "").upper() + " " + tr.get("symbol", "") +
+                    " @ $" + str(tr.get("price", 0)) + " - " + tr.get("time", "")[:16]
+                )
+            reply = "\n".join(lines)
+
+    elif tl == "/positions":
+        if not trader.positions:
+            reply = "No open positions."
+        else:
+            lines = ["Open positions:"]
+            for symbol, pos in trader.positions.items():
+                token = symbol.replace("/USDT", "")
+                pd = get_price(token)
+                current = pd.get("price", 0) or 0
+                entry = pos.get("entry_price", 0)
+                pnl = ((current - entry) / entry * 100) if entry else 0
+                lines.append(symbol + ": entry $" + str(entry) + " | now $" + str(current) + " | PnL " + str(round(pnl, 1)) + "%")
+            reply = "\n".join(lines)
+
+    elif tl == "/strategy":
+        s = load_strategy()
+        reply = (
+            "Strategy v" + str(s.get("version", 1)) + "\n"
+            "Win rate: " + str(round(s.get("win_rate", 0) * 100, 1)) + "%\n"
+            "Total trades: " + str(s.get("total_trades", 0)) + "\n\n"
+            "Rules:\n" + s.get("rules", "none") + "\n\n"
+            "Notes: " + (", ".join(s.get("notes", [])) or "none")
+        )
+
+    elif tl == "/research":
+        research = rj(RESEARCH_FILE, [])[:5]
+        if not research:
+            reply = "No research yet."
+        else:
+            lines = ["Last " + str(len(research)) + " items:"]
+            for r in research:
+                lines.append("\n[" + r["time"][:10] + "] " + r["topic"] + "\n" + r["summary"][:200])
+            reply = "\n".join(lines)
+
+    elif tl == "/whales":
+        whale_log = rj(WHALE_FILE, [])
+        if not whale_log:
+            reply = "No whale activity recorded yet."
+        else:
+            latest = whale_log[0]
+            reply = (
+                "Latest whale activity [" + latest["time"][:16] + "]:\n\n" +
+                "\n".join(latest.get("alerts", [])) +
+                "\n\n" + latest.get("analysis", "")[:400]
+            )
+
+    elif tl == "/sentiment":
+        fg = get_fear_greed()
+        news = web_search("crypto sentiment today", max_results=3)
+        reply = "Fear & Greed: " + str(fg.get("value")) + " - " + str(fg.get("label")) + "\n\nNews:\n" + news[:400]
+
+    elif tl == "/scan":
+        send_telegram("Running full scan now...")
+        threading.Thread(target=market_scan_loop, daemon=True).start()
+        threading.Thread(target=dex_discovery_loop, daemon=True).start()
+        threading.Thread(target=whale_tracker_loop, daemon=True).start()
+        reply = "Scans started."
+
+    elif tl.startswith("dex "):
+        query = t[4:].strip()
+        result = search_dex(query)
+        reply = "DexScreener: " + query + "\n\n" + result
+
+    elif tl.startswith("search "):
+        query = t[7:].strip()
+        result = web_search(query)
+        reply = "Search: " + query + "\n\n" + result
+
+    elif tl.startswith("analyze "):
+        symbol = t[8:].strip()
+        result = web_search(symbol + " price prediction analysis today")
+        reply = think("Market research for " + symbol + ":\n" + result + "\n\nDirection, confidence, reasoning, risk.")
+
+    elif tl.startswith("implement "):
+        code = t[10:].strip()
+        save_pending(code)
+        send_telegram("Proposed code:\n\n" + code + "\n\nReply 'yes implement' to apply or 'no implement' to reject.")
+        reply = "Proposal saved. Awaiting your approval."
+
+    elif tl == "yes implement":
+        pending = load_pending()
+        if pending:
+            try:
+                with open(__file__, "r", encoding="utf-8") as f:
+                    current = f.read()
+                with open(__file__, "w", encoding="utf-8") as f:
+                    f.write(current + "\n\n# === AUTO-IMPLEMENTED " + datetime.now().isoformat() + " ===\n" + pending + "\n")
+                save_pending(None)
+                reply = "Implemented. Send /restart to reload."
+            except Exception as e:
+                reply = "Failed: " + str(e)
+        else:
+            reply = "No pending implementation."
+
+    elif tl == "no implement":
+        save_pending(None)
+        reply = "Rejected and cleared."
+
+    elif tl == "/restart":
+        send_telegram("Restarting Nexus...")
+        time.sleep(1)
+        os.execl(sys.executable, sys.executable, __file__)
+
+    else:
+        market = rj(MARKET_FILE, {})
+        ctx = (" [Market context: " + market["summary"] + "]") if market.get("summary") else ""
+        reply = think((t or "(empty)") + ctx, history[-20:])
+        if "SEARCH:" in reply:
+            try:
+                query = reply.split("SEARCH:")[1].split("\n")[0].strip()
+                results = web_search(query)
+                reply = think("Search results for '" + query + "':\n" + results + "\n\nAnswer using these.", history[-20:])
+            except Exception:
+                pass
+        history.append({"role": "user", "content": t or ""})
+        history.append({"role": "assistant", "content": reply})
+        save_conv(history)
+
+    return reply
+
+
+# =============================================================================
+# TELEGRAM LISTENER
+# =============================================================================
+def start_listener():
+    offset = 0
+    print("Nexus listener active...")
+    while True:
+        try:
+            r = requests.get(
+                "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/getUpdates",
+                params={"offset": offset, "timeout": 30}, timeout=35
+            )
+            updates = r.json().get("result", [])
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                text     = msg.get("text", "")
+                caption  = msg.get("caption", "")
+                photo    = msg.get("photo")
+                document = msg.get("document")
+                chat_id  = str((msg.get("chat") or {}).get("id", ""))
+                if not (text or photo or document):
+                    continue
+                if chat_id != TELEGRAM_CHAT_ID:
+                    continue
+                print("[" + datetime.now().strftime("%H:%M:%S") + "] " + (text or "[media]")[:60])
+                try:
+                    reply = handle_message(text, photo=photo, document=document, caption=caption)
+                    send_telegram(reply)
+                except Exception as e:
+                    send_telegram("Error: " + str(e))
+                    print("Handler error: " + str(e))
+        except Exception as e:
+            print("Listener error: " + str(e))
+            time.sleep(5)
+        time.sleep(1)
+
+
+# =============================================================================
+# SCHEDULER
+# =============================================================================
+def setup_scheduler():
+    schedule.every(15).minutes.do(market_scan_loop)
+    schedule.every(20).minutes.do(dex_discovery_loop)
+    schedule.every(30).minutes.do(whale_tracker_loop)
+    schedule.every(1).hours.do(learning_loop)
+    schedule.every(2).hours.do(research_loop)
+    schedule.every(2).hours.do(sentiment_scan_loop)
+    schedule.every(3).hours.do(content_generation_loop)
+    schedule.every(6).hours.do(deep_thinking_loop)
+
+    def run():
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+if __name__ == "__main__":
+    print("=" * 55)
+    print("NEXUS AUTONOMOUS - Starting")
+    print("Time: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("Chat ID: " + TELEGRAM_CHAT_ID)
+    print("Paper trading: " + str(PAPER_TRADING))
+    print("=" * 55)
+
+    setup_scheduler()
+
+    print("Loops active:")
+    print("  Market scan    - every 15 min")
+    print("  DEX discovery  - every 20 min")
+    print("  Whale tracker  - every 30 min")
+    print("  Learning       - every 1 hour")
+    print("  Research       - every 2 hours")
+    print("  Sentiment      - every 2 hours")
+    print("  Content        - every 3 hours")
+    print("  Deep thinking  - every 6 hours")
+    print("=" * 55)
+
+    # First scans immediately on startup
+    threading.Thread(target=market_scan_loop, daemon=True).start()
+    threading.Thread(target=dex_discovery_loop, daemon=True).start()
+    threading.Thread(target=sentiment_scan_loop, daemon=True).start()
+
+    send_telegram(
+        "Nexus autonomous mode activated.\n\n"
+        "Running 8 background loops 24/7.\n\n"
+        "Commands:\n"
+        "/status /market /trades /positions\n"
+        "/strategy /research /whales /sentiment\n"
+        "/scan - trigger manual scan\n"
+        "dex [token] - DexScreener search\n"
+        "search [query] - web search\n"
+        "analyze [symbol] - deep analysis\n"
+        "implement [code] - propose self-mod\n"
+        "/restart"
+    )
+
+    start_listener()
