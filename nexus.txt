@@ -30,7 +30,7 @@ from pathlib import Path
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-ANTHROPIC_API_KEY   = "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"
+ANTHROPIC_API_KEY   = "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"
 TELEGRAM_BOT_TOKEN  = "8730514401:AAGM-57-7i1F6vXtiklfFYvQtHd1gxhAGOU"
 TELEGRAM_CHAT_ID    = "8449301826"
 TELEGRAM_CHANNEL_ID = "-1003414072432"
